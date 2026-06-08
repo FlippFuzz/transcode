@@ -1,15 +1,19 @@
 import os
-import subprocess
 import glob
 import math
 from concurrent.futures import ThreadPoolExecutor
+from fabric import Connection, Config
+from paramiko import AutoAddPolicy
+from tqdm import tqdm
 
 # ================= CONFIGURATION =================
 from config_local import VMS, LOCAL_INPUT_DIR, LOCAL_OUTPUT_DIR
 
 # Remote Linux Paths on the VMs
-REMOTE_INPUT = "/home/ubuntu/transcode/input"
-REMOTE_OUTPUT = "/home/ubuntu/transcode/output"
+REMOTE_INPUT = "/home/ubuntu/transcode/02_transcode_queue"
+REMOTE_OUTPUT = "/home/ubuntu/transcode/04_transcode_finished"
+REMOTE_STAGING_IN = "/home/ubuntu/transcode/01_upload_staging"
+REMOTE_STAGING_OUT = "/home/ubuntu/transcode/03_transcode_staging"
 
 # Video extensions to scan for
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".m4v")
@@ -18,148 +22,252 @@ MIN_VM_FREE_SPACE_GB = 15
 # =================================================
 
 
-def run_ssh(vm, command):
-    """Executes a command on a remote VM via Windows built-in SSH client."""
-    ssh_cmd = [
-        "ssh",
-        "-i",
-        vm["key"],
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=5",
-        f"{vm['user']}@{vm['ip']}",
-        command,
-    ]
-    # Set shell=True on Windows to prevent console windows from popping up
-    return subprocess.run(ssh_cmd, capture_output=True, text=True)
+def get_connection(vm) -> Connection:
+    """Establishes a Fabric Connection."""
+    # Create a Config object to set the missing host key policy
+    config = Config()
+    # AutoAddPolicy is equivalent to StrictHostKeyChecking=no
+    # This ensures that unknown host keys are automatically added to known_hosts.
+    config.missing_host_key_policy = AutoAddPolicy()
+
+    return Connection(
+        host=vm["ip"],
+        user=vm["user"],
+        connect_kwargs={"key_filename": vm["key"]},
+        connect_timeout=10,
+        config=config,  # Pass the custom config
+    )
 
 
-def get_vm_free_space_gb(vm):
+def get_vm_free_space_gb(conn, vm_name):
     """Queries the VM for its available disk space on the root partition."""
-    # df -BG returns sizes in Gigabytes. We extract the 'Available' column.
-    res = run_ssh(vm, "df -BG / | tail -n 1 | awk '{print $4}'")
-    if res.returncode == 0:
-        try:
-            # Output is usually something like "35G" or "35". We extract the number.
-            clean = "".join(c for c in res.stdout.strip() if c.isdigit())
-            return int(clean) if clean else 0
-        except ValueError:
+    try:
+        # hide=True prevents output from leaking to stdout; warn=True prevents exceptions on non-zero exit
+        result = conn.run("df -BG --output=avail /", hide=True, warn=True)
+        if not result.ok:
             return 0
+        output = result.stdout
+    except Exception as e:
+        tqdm.write(f"[{vm_name}] Warning: Space check failed. Error: {e}")
+        return 0
+
+    for line in output.splitlines():
+        line = line.strip()
+        clean = "".join(c for c in line if c.isdigit())
+        if clean:
+            return int(clean)
     return 0
 
 
-def list_remote_files(vm, directory):
-    """Lists files in a remote directory."""
-    res = run_ssh(vm, f"ls -1 {directory}")
-    if res.returncode == 0:
-        return [f.strip() for f in res.stdout.split("\n") if f.strip()]
-    return []
+def list_remote_files(sftp, directory):
+    """Lists files in a remote directory using SFTP."""
+    try:
+        return sftp.listdir(directory)
+    except IOError:
+        # Directory might not exist or be empty
+        return []
 
 
-def get_active_remote_basenames():
-    """Scans all VMs to see which video basenames are already in progress."""
+def get_remote_status():
+    """Scans all VMs to categorize files as active or staged."""
     active = set()
+    staged_map = {}  # {vm_ip: {basenames}}
+
     for vm in VMS:
-        print(f"Checking status of {vm['name']}...")
-        for folder in [REMOTE_INPUT, REMOTE_OUTPUT]:
-            files = list_remote_files(vm, folder)
-            for f in files:
-                base, _ = os.path.splitext(f)
-                # If a transcode failed and was renamed to 'file.mp4.failed', clean the extension
-                if base.endswith(".failed"):
-                    base = os.path.splitext(base)[0]
-                active.add(base.lower())
-    return active
+        tqdm.write(f"Checking status of {vm['name']}...")
+        staged_map[vm["ip"]] = set()
+        try:
+            with get_connection(
+                vm
+            ) as conn:  # Connection context manager handles client setup
+                sftp = conn.sftp()
+
+                # Files in input, output, or currently being transcoded (outbound staging) are active
+                for folder in [REMOTE_INPUT, REMOTE_OUTPUT, REMOTE_STAGING_OUT]:
+                    files = list_remote_files(sftp, folder)
+                    for f in files:
+                        base, _ = os.path.splitext(f)
+                        active.add(base.lower())
+
+                # Check inbound staging for interrupted uploads
+                staging_files = list_remote_files(sftp, REMOTE_STAGING_IN)
+                for f in staging_files:
+                    base, _ = os.path.splitext(f)
+                    staged_map[vm["ip"]].add(base.lower())
+        except Exception as e:
+            tqdm.write(f"Could not connect to {vm['name']}: {e}")
+
+    return active, staged_map
 
 
-def upload_file(vm, local_path):
-    """Uploads file directly to remote input directory."""
+def upload_file(conn, sftp, vm_name, local_path, vm_index):
+    """Uploads file to staging with resumption, then moves it to input atomically."""
     filename = os.path.basename(local_path)
+    remote_staging_path = f"{REMOTE_STAGING_IN}/{filename}"
     remote_input_path = f"{REMOTE_INPUT}/{filename}"
 
-    print(f"Uploading '{filename}' to {vm['name']}...")
+    tqdm.write(f"Uploading '{filename}' to {vm_name} (staging)...")
 
-    # Use Windows built-in scp
-    scp_cmd = [
-        "scp",
-        "-i",
-        vm["key"],
-        "-o",
-        "StrictHostKeyChecking=no",
-        local_path,
-        f"{vm['user']}@{vm['ip']}:{remote_input_path}",
-    ]
+    try:
+        # Resumption logic: Check if remote file exists and get its size
+        remote_size = 0
+        try:
+            remote_stat = sftp.stat(remote_staging_path)
+            remote_size = remote_stat.st_size
+        except IOError:
+            pass  # File doesn't exist yet
 
-    transfer = subprocess.run(scp_cmd)
-    if transfer.returncode == 0:
-        print(f"Successfully enqueued '{filename}' on {vm['name']}.")
-        return True
-    print(f"Failed to upload '{filename}' to {vm['name']}.")
+        local_size = os.path.getsize(local_path)
+
+        if remote_size > local_size:
+            tqdm.write(
+                f"[{vm_name}] Remote staging file larger than local. Restarting upload."
+            )
+            remote_size = 0
+
+        if remote_size < local_size:
+            mode = "ab" if remote_size > 0 else "wb"
+            if remote_size > 0:
+                tqdm.write(
+                    f"[{vm_name}] Resuming upload of '{filename}' from {remote_size / (1024**2):.2f} MB"
+                )
+
+            with tqdm(
+                total=local_size,
+                initial=remote_size,
+                unit="B",
+                unit_scale=True,
+                desc=f"[{vm_name}] Uploading {filename}",
+                position=vm_index,
+                leave=False,
+            ) as pbar:
+                with open(local_path, "rb") as f_local:
+                    f_local.seek(remote_size)
+                    with sftp.open(remote_staging_path, mode) as f_remote:
+                        # Buffer size of 32KB is generally efficient for SFTP
+                        while True:
+                            chunk = f_local.read(32768)
+                            if not chunk:
+                                break
+                            f_remote.write(chunk)
+                            pbar.update(len(chunk))
+
+        tqdm.write(f"Transfer complete. Moving to input folder on {vm_name}...")
+        result = conn.run(
+            f'mv "{remote_staging_path}" "{remote_input_path}"', hide=True, warn=True
+        )
+        if result.ok:
+            tqdm.write(f"Successfully enqueued '{filename}' on {vm_name}.")
+            return True
+    except Exception as e:
+        tqdm.write(f"Failed to upload '{filename}' to {vm_name}: {e}")
     return False
 
 
-def process_vm(vm, files_to_upload):
+def process_vm(vm, files_to_upload, vm_index):
     """Handles the full lifecycle (download, space check, upload) for a single VM."""
-    # ------------------ PHASE 1: DOWNLOAD COMPLETED ENCODES ------------------
-    completed_files = list_remote_files(vm, REMOTE_OUTPUT)
-    for filename in completed_files:
-        if filename.startswith("."):
-            continue
+    try:
+        with get_connection(
+            vm
+        ) as conn:  # Connection context manager handles client setup
+            sftp = conn.sftp()
 
-        remote_path = f"{REMOTE_OUTPUT}/{filename}"
-        local_path = os.path.join(LOCAL_OUTPUT_DIR, filename)
+            # ------------------ PHASE 1: DOWNLOAD COMPLETED ENCODES ------------------
+            completed_files = list_remote_files(sftp, REMOTE_OUTPUT)
+            for filename in completed_files:
+                if filename.startswith("."):
+                    continue
 
-        print(f"[{vm['name']}] Found completed file '{filename}'. Downloading...")
-        scp_cmd = [
-            "scp",
-            "-i",
-            vm["key"],
-            "-o",
-            "StrictHostKeyChecking=no",
-            f"{vm['user']}@{vm['ip']}:{remote_path}",
-            local_path,
-        ]
+                remote_path = f"{REMOTE_OUTPUT}/{filename}"
+                local_path = os.path.join(LOCAL_OUTPUT_DIR, filename)
 
-        download = subprocess.run(scp_cmd, capture_output=True)
-        if (
-            download.returncode == 0
-            and os.path.exists(local_path)
-            and os.path.getsize(local_path) > 0
-        ):
-            print(f"[{vm['name']}] Download complete. Deleting remote copy...")
-            run_ssh(vm, f'rm "{remote_path}"')
+                try:
+                    remote_size = sftp.stat(remote_path).st_size
+                    local_size = (
+                        os.path.getsize(local_path) if os.path.exists(local_path) else 0
+                    )
 
-            # Find and delete local original raw video
-            base_name, _ = os.path.splitext(filename)
-            for ext in VIDEO_EXTENSIONS:
-                local_original = os.path.join(LOCAL_INPUT_DIR, base_name + ext)
-                if os.path.exists(local_original):
-                    print(f"[{vm['name']}] Deleting local original: {local_original}")
-                    os.remove(local_original)
-                    break
+                    if local_size > remote_size:
+                        tqdm.write(
+                            f"[{vm['name']}] Local file larger than remote. Restarting download."
+                        )
+                        local_size = 0
 
-    # ------------------ PHASE 2: UPLOAD NEW RAW VIDEOS ------------------
-    if not files_to_upload:
-        return
+                    if local_size < remote_size:
+                        tqdm.write(f"[{vm['name']}] Downloading '{filename}'...")
+                        if local_size > 0:
+                            tqdm.write(
+                                f"[{vm['name']}] Resuming download from {local_size / (1024**2):.2f} MB"
+                            )
 
-    space = get_vm_free_space_gb(vm)
-    print(f"[{vm['name']}] Current free space: {space} GB.")
+                        mode = "ab" if local_size > 0 else "wb"
+                        with tqdm(
+                            total=remote_size,
+                            initial=local_size,
+                            unit="B",
+                            unit_scale=True,
+                            desc=f"[{vm['name']}] Downloading {filename}",
+                            position=vm_index,
+                            leave=False,
+                        ) as pbar:
+                            with sftp.open(remote_path, "rb") as f_remote:
+                                f_remote.seek(local_size)
+                                with open(local_path, mode) as f_local:
+                                    while True:
+                                        chunk = f_remote.read(32768)
+                                        if not chunk:
+                                            break
+                                        f_local.write(chunk)
+                                        pbar.update(len(chunk))
 
-    for local_file in files_to_upload:
-        filename = os.path.basename(local_file)
-        file_size_gb = os.path.getsize(local_file) / (1024**3)
-        required_space = max(MIN_VM_FREE_SPACE_GB, math.ceil(file_size_gb * 3))
+                    # Verify completion before cleanup
+                    if (
+                        os.path.exists(local_path)
+                        and os.path.getsize(local_path) == remote_size
+                    ):
+                        tqdm.write(
+                            f"[{vm['name']}] Download complete. Deleting remote copy..."
+                        )
+                        sftp.remove(remote_path)
 
-        if space > required_space:
-            success = upload_file(vm, local_file)
-            if success:
-                # Update local space tracking for this thread
-                space -= math.ceil(file_size_gb * 2.5)
-        else:
-            print(
-                f"[{vm['name']}] Skipping '{filename}' - insufficient space (needs {required_space} GB)."
-            )
+                        # Find and delete local original raw video
+                        base_name, _ = os.path.splitext(filename)
+                        for ext in VIDEO_EXTENSIONS:
+                            local_original = os.path.join(
+                                LOCAL_INPUT_DIR, base_name + ext
+                            )
+                            if os.path.exists(local_original):
+                                tqdm.write(
+                                    f"[{vm['name']}] Deleting local original: {local_original}"
+                                )
+                                os.remove(local_original)
+                                break
+                except Exception as e:
+                    tqdm.write(f"[{vm['name']}] Error downloading {filename}: {e}")
+
+            # ------------------ PHASE 2: UPLOAD NEW RAW VIDEOS ------------------
+            if not files_to_upload:
+                return
+
+            space = get_vm_free_space_gb(conn, vm["name"])
+            tqdm.write(f"[{vm['name']}] Current free space: {space} GB.")
+
+            for local_file in files_to_upload:
+                filename = os.path.basename(local_file)
+                file_size_gb = os.path.getsize(local_file) / (1024**3)
+                required_space = max(MIN_VM_FREE_SPACE_GB, math.ceil(file_size_gb * 3))
+
+                if space > required_space:
+                    success = upload_file(conn, sftp, vm["name"], local_file, vm_index)
+                    if success:
+                        # Update local space tracking for this thread
+                        space -= math.ceil(file_size_gb * 2.5)
+                else:
+                    tqdm.write(
+                        f"[{vm['name']}] Skipping '{filename}' - insufficient space (needs {required_space} GB)."
+                    )
+    except Exception as e:
+        tqdm.write(f"[{vm['name']}] Connection or Task failed: {e}")
 
 
 def main():
@@ -168,35 +276,56 @@ def main():
 
     print("--- Initializing Parallel Sync ---")
 
-    # Check which files are already active on ANY VM to avoid duplicate uploads
-    active_remotes = get_active_remote_basenames()
+    # Get remote status to avoid duplicates and find interrupted uploads
+    active_remotes, staged_map = get_remote_status()
 
     # Scan for local candidates
     print("\n--- Scanning for New Local Videos ---")
-    local_files = [
+    all_local_files = [
         f
         for f in glob.glob(os.path.join(LOCAL_INPUT_DIR, "*"))
-        if os.path.isfile(f)
-        and f.lower().endswith(VIDEO_EXTENSIONS)
-        and os.path.splitext(os.path.basename(f))[0].lower() not in active_remotes
+        if os.path.isfile(f) and f.lower().endswith(VIDEO_EXTENSIONS)
     ]
 
-    if not local_files:
+    # Filter out files already in Input or Output on any VM
+    files_to_process = [
+        f
+        for f in all_local_files
+        if os.path.splitext(os.path.basename(f))[0].lower() not in active_remotes
+    ]
+
+    if not files_to_process:
         print("No new local videos to process.")
     else:
-        print(
-            f"Found {len(local_files)} new files. Performing rough split across {len(VMS)} VMs."
-        )
+        print(f"Found {len(files_to_process)} candidates. Assigning to VMs...")
 
-    # Perform the "Rough Split" (Round Robin)
+    # Assignment Logic
     vm_assignments = [[] for _ in range(len(VMS))]
-    for i, file_path in enumerate(local_files):
+    unassigned = []
+
+    for file_path in files_to_process:
+        basename = os.path.splitext(os.path.basename(file_path))[0].lower()
+        assigned = False
+        # If file was already in staging on a specific VM, resume it there
+        for i, vm in enumerate(VMS):
+            if basename in staged_map[vm["ip"]]:
+                vm_assignments[i].append(file_path)
+                assigned = True
+                tqdm.write(
+                    f"Resuming interrupted upload of '{basename}' on {vm['name']}."
+                )
+                break
+        if not assigned:
+            unassigned.append(file_path)
+
+    # Round-robin the remaining files
+    for i, file_path in enumerate(unassigned):
         vm_assignments[i % len(VMS)].append(file_path)
 
     # Run parallel tasks
     with ThreadPoolExecutor(max_workers=len(VMS)) as executor:
         for i, vm in enumerate(VMS):
-            executor.submit(process_vm, vm, vm_assignments[i])
+            executor.submit(process_vm, vm, vm_assignments[i], i)
 
     print("\n--- All VM tasks submitted ---")
 

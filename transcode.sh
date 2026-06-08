@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 
 # Configuration - Adjust these paths as needed on your cloud instance
-INPUT_DIR="/home/ubuntu/transcode/input"
-OUTPUT_DIR="/home/ubuntu/transcode/output"
+INPUT_DIR="/home/ubuntu/transcode/02_transcode_queue"
+OUTPUT_DIR="/home/ubuntu/transcode/04_transcode_finished"
+STAGING_DIR="/home/ubuntu/transcode/03_transcode_staging"
+UPLOAD_STAGING_DIR="/home/ubuntu/transcode/01_upload_staging"
 LOCK_FILE="/tmp/transcode_process.lock"
 LOG_FILE="/home/ubuntu/transcode/transcode.log"
 FFMPEG_BIN="/home/ubuntu/transcode/ffmpeg"
 MAX_LOG_SIZE=5242880 # 5MB
+UPDATE_INTERVAL=3600 # Check for updates once per hour (3600 seconds)
+UPDATE_STAMP="/tmp/.transcode_update_stamp"
+FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
 
 # Ensure directories exist
-mkdir -p "$INPUT_DIR" "$OUTPUT_DIR"
+mkdir -p "$INPUT_DIR" "$OUTPUT_DIR" "$STAGING_DIR" "$UPLOAD_STAGING_DIR"
 
 # Log rotation: If log file exceeds MAX_LOG_SIZE, rotate it
 if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -gt $MAX_LOG_SIZE ]; then
@@ -24,6 +29,47 @@ fi
 # This prevents CPU over-saturation if a previous cron job is still processing.
 exec 200>"$LOCK_FILE"
 flock -n 200 || { echo "Transcode process already running. Exiting." >> "$LOG_FILE"; exit 1; }
+
+# --- Self-Update Logic ---
+# Only check for updates if the interval has passed to be a good citizen to GitHub.
+# Also trigger if FFmpeg is missing entirely.
+if [ ! -f "$FFMPEG_BIN" ] || [ $(( $(date +%s) - $(stat -c %Y "$UPDATE_STAMP" 2>/dev/null || echo 0) )) -gt $UPDATE_INTERVAL ]; then
+    touch "$UPDATE_STAMP"
+
+    # 1. Update ffmpeg (BtbN builds are frequent and include SVT-AV1 improvements)
+    # wget -N uses timestamping to only download if the remote file is newer than the local archive
+    FFMPEG_DIR=$(dirname "$FFMPEG_BIN")
+    ARCHIVE_PATH="$FFMPEG_DIR/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+    
+    if wget -qN "$FFMPEG_URL" -P "$FFMPEG_DIR"; then
+        # If the archive is newer than the existing binary, extract and replace it
+        if [ "$ARCHIVE_PATH" -nt "$FFMPEG_BIN" ]; then
+            echo "--- New ffmpeg version detected. Updating binary... ---" >> "$LOG_FILE"
+            tar -xf "$ARCHIVE_PATH" -C "$FFMPEG_DIR"
+            mv "$FFMPEG_DIR/ffmpeg-master-latest-linuxarm64-gpl/bin/ffmpeg" "$FFMPEG_BIN"
+            rm -rf "$FFMPEG_DIR/ffmpeg-master-latest-linuxarm64-gpl"
+        fi
+    fi
+
+    # 2. Update the script itself from Git
+    cd "$(dirname "$0")"
+    if [ -d .git ]; then
+        OLD_HASH=$(git rev-parse HEAD 2>/dev/null)
+        if git pull >> "$LOG_FILE" 2>&1; then
+            NEW_HASH=$(git rev-parse HEAD 2>/dev/null)
+            if [ "$OLD_HASH" != "$NEW_HASH" ]; then
+                echo "--- Script updated from $OLD_HASH to $NEW_HASH. Restarting... ---" >> "$LOG_FILE"
+                exec "$0" "$@"
+            fi
+        fi
+    fi
+fi
+
+# Final safety check: If ffmpeg is still missing (e.g. download failed), exit
+if [ ! -f "$FFMPEG_BIN" ]; then
+    echo "ERROR: ffmpeg binary not found at $FFMPEG_BIN and update failed. Exiting." >> "$LOG_FILE"
+    exit 1
+fi
 
 echo "--- Starting transcode session: $(date) ---" >> "$LOG_FILE"
 
@@ -47,8 +93,9 @@ for filepath in "$INPUT_DIR"/*; do
 
     echo "Processing: $filename" >> "$LOG_FILE"
 
-    # Define the output path. Extension is set to .mkv.
-    output_path="$OUTPUT_DIR/${filename%.*}.mkv"
+    # Define staging and final paths. Extension is set to .mkv.
+    staging_path="$STAGING_DIR/${filename%.*}.mkv"
+    final_path="$OUTPUT_DIR/${filename%.*}.mkv"
 
     # Run ffmpeg with SVT-AV1 at low priority (nice) to keep the system responsive.
     # 'time' is included to log the duration of each transcode.
@@ -56,8 +103,13 @@ for filepath in "$INPUT_DIR"/*; do
     # Test Input file: 3.8G
     # Preset 4 - about speed=0.25x, 1.6G - I am OK with the slower speed for 100MB size difference
     # Preset 6 - about speed=0.479x, 1.7G
-    if nice -n 19 time "$FFMPEG_BIN" -threads 4 -i "$filepath" -c:v libsvtav1 -preset 4 -crf 28 \
-        -pix_fmt yuv420p10le -svtav1-params tune=0:scd=1:lp=4 -c:a libopus -b:a 128k -y "$output_path" >> "$LOG_FILE" 2>&1; then
+    nice -n 19 time "$FFMPEG_BIN" -stats_period 60 \
+        -threads 4 -i "$filepath" -c:v libsvtav1 -preset 4 -crf 28 \
+        -pix_fmt yuv420p10le -svtav1-params tune=0:scd=1:lp=4 -c:a libopus -b:a 128k \
+        -y "$staging_path" 2>&1 | tr '\r' '\n' >> "$LOG_FILE"
+
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        mv "$staging_path" "$final_path"
         echo "Successfully transcoded: $filename" >> "$LOG_FILE"
         # Only delete source file on success
         rm "$filepath"

@@ -24,27 +24,28 @@ The project consists of two main components:
 
 ---
 
-# Server install instructions
+# Data Flow
 
-## Clone repo + Setup cron job
+To ensure stability and allow for future pipeline stages, the project uses a numbered directory structure:
+
+1.  **Local Source:** The local directory where you place raw video files.
+2.  **`01_upload_staging` (Server):** Temporary area for incoming files (prevents processing partial uploads).
+3.  **`02_transcode_queue` (Server):** Files moved here are picked up by `transcode.sh` for processing.
+4.  **`03_transcode_staging` (Server):** Where `ffmpeg` writes the temporary output file during encoding.
+5.  **`04_transcode_finished` (Server):** Final server destination for completed files, waiting for download.
+6.  **Local Destination:** The local directory where finished files are automatically retrieved.
+
+# Server instructions
+
+## Install
+
+### Clone repo + Setup cron job
 ```bash
 cd /home/ubuntu
 git clone https://github.com/FlippFuzz/transcode
 cd transcode
 chmod +x transcode.sh
 
-# Create the directories expected by the sync script
-mkdir -p /home/ubuntu/transcode/input /home/ubuntu/transcode/output
-
 # Add the cron job to run every minute (non-interactive and idempotent)
 (crontab -l 2>/dev/null | grep -Fv "/home/ubuntu/transcode/transcode.sh"; echo "* * * * * /home/ubuntu/transcode/transcode.sh") | crontab -
-```
-
-## Download ffmpeg
-```bash
-cd /home/ubuntu/transcode
-wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz
-tar -xvf ffmpeg-master-latest-linuxarm64-gpl.tar.xz
-mv ffmpeg-master-latest-linuxarm64-gpl/bin/* .
-rm -rf ffmpeg-master-latest-linuxarm64-gpl  ffmpeg-master-latest-linuxarm64-gpl.tar.xz
 ```
