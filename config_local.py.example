@@ -1,0 +1,31 @@
+# Define your 4 Oracle Cloud VMs
+VMS = [
+    {
+        "name": "vm1",
+        "ip": "100.101.102.1",
+        "user": "ubuntu",
+        "key": r"C:\Users\YourName\.ssh\oracle_key",
+    },
+    {
+        "name": "vm2",
+        "ip": "100.101.102.2",
+        "user": "ubuntu",
+        "key": r"C:\Users\YourName\.ssh\oracle_key",
+    },
+    {
+        "name": "vm3",
+        "ip": "100.101.102.3",
+        "user": "ubuntu",
+        "key": r"C:\Users\YourName\.ssh\oracle_key",
+    },
+    {
+        "name": "vm4",
+        "ip": "100.101.102.4",
+        "user": "ubuntu",
+        "key": r"C:\Users\YourName\.ssh\oracle_key",
+    },
+]
+
+# Local Windows Paths (Use raw strings 'r' to handle backslashes)
+LOCAL_INPUT_DIR = r"D:\Videos\ToConvert"
+LOCAL_OUTPUT_DIR = r"D:\Videos\Converted"
