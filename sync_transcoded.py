@@ -3,11 +3,17 @@ import glob
 import math
 from concurrent.futures import ThreadPoolExecutor
 from fabric import Connection, Config
+from paramiko import common
 from paramiko import AutoAddPolicy
 from tqdm import tqdm
 
 # ================= CONFIGURATION =================
 from config_local import VMS, LOCAL_INPUT_DIR, LOCAL_OUTPUT_DIR
+
+# Optimize Paramiko for high-latency/high-bandwidth connections (WinSCP-like behavior)
+# These settings increase the amount of data in flight (like WinSCP does)
+common.DEFAULT_WINDOW_SIZE = 62500000  # 62.5MB (Twice the BDP for 1Gbps @ 250ms)
+common.DEFAULT_MAX_PACKET_SIZE = 1048576  # 1MB
 
 # Remote Linux Paths on the VMs
 REMOTE_INPUT = "/home/ubuntu/transcode/02_transcode_queue"
@@ -144,9 +150,10 @@ def upload_file(conn, sftp, vm_name, local_path, vm_index):
                 with open(local_path, "rb") as f_local:
                     f_local.seek(remote_size)
                     with sftp.open(remote_staging_path, mode) as f_remote:
-                        # Buffer size of 32KB is generally efficient for SFTP
+                        f_remote.set_pipelined(True)  # Enable WinSCP-style pipelining
+                        # Use 1MB buffer to reduce Python overhead
                         while True:
-                            chunk = f_local.read(32768)
+                            chunk = f_local.read(1048576)
                             if not chunk:
                                 break
                             f_remote.write(chunk)
@@ -212,9 +219,11 @@ def process_vm(vm, files_to_upload, vm_index):
                         ) as pbar:
                             with sftp.open(remote_path, "rb") as f_remote:
                                 f_remote.seek(local_size)
+                                f_remote.prefetch()  # Request chunks in advance for speed
                                 with open(local_path, mode) as f_local:
                                     while True:
-                                        chunk = f_remote.read(32768)
+                                        # Read in 1MB chunks from the prefetch buffer
+                                        chunk = f_remote.read(1048576)
                                         if not chunk:
                                             break
                                         f_local.write(chunk)
