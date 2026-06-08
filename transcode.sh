@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Configuration - Adjust these paths as needed on your cloud instance
-INPUT_DIR="/home/ubuntu/input"
-OUTPUT_DIR="/home/ubuntu/output"
+INPUT_DIR="/home/ubuntu/transcode/input"
+OUTPUT_DIR="/home/ubuntu/transcode/output"
 LOCK_FILE="/tmp/transcode_process.lock"
 LOG_FILE="/home/ubuntu/transcode/transcode.log"
 FFMPEG_BIN="/home/ubuntu/transcode/ffmpeg"

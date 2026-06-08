@@ -34,7 +34,7 @@ cd transcode
 chmod +x transcode.sh
 
 # Create the directories expected by the sync script
-mkdir -p /home/ubuntu/input /home/ubuntu/output
+mkdir -p /home/ubuntu/transcode/input /home/ubuntu/transcode/output
 
 # Add the cron job to run every minute (non-interactive and idempotent)
 (crontab -l 2>/dev/null | grep -Fv "/home/ubuntu/transcode/transcode.sh"; echo "* * * * * /home/ubuntu/transcode/transcode.sh") | crontab -

@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from config_local import VMS, LOCAL_INPUT_DIR, LOCAL_OUTPUT_DIR
 
 # Remote Linux Paths on the VMs
-REMOTE_INPUT = "/home/ubuntu/input"
-REMOTE_OUTPUT = "/home/ubuntu/output"
+REMOTE_INPUT = "/home/ubuntu/transcode/input"
+REMOTE_OUTPUT = "/home/ubuntu/transcode/output"
 
 # Video extensions to scan for
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".m4v")
