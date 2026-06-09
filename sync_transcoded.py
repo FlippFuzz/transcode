@@ -1,25 +1,33 @@
 import os
+import subprocess
 import glob
 import math
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from fabric import Connection, Config
 from paramiko import common
 from paramiko import AutoAddPolicy
-from tqdm import tqdm
 
 # ================= CONFIGURATION =================
 from config_local import VMS, LOCAL_INPUT_DIR, LOCAL_OUTPUT_DIR
 
+# Configure logging to stdout
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 # Optimize Paramiko for high-latency/high-bandwidth connections (WinSCP-like behavior)
 # These settings increase the amount of data in flight (like WinSCP does)
 common.DEFAULT_WINDOW_SIZE = 62500000  # 62.5MB (Twice the BDP for 1Gbps @ 250ms)
-common.DEFAULT_MAX_PACKET_SIZE = 1048576  # 1MB
+common.DEFAULT_MAX_PACKET_SIZE = 32768  # 32KB (Standard SFTP packet limit)
 
 # Remote Linux Paths on the VMs
 REMOTE_INPUT = "/home/ubuntu/transcode/02_transcode_queue"
 REMOTE_OUTPUT = "/home/ubuntu/transcode/04_transcode_finished"
 REMOTE_STAGING_IN = "/home/ubuntu/transcode/01_upload_staging"
 REMOTE_STAGING_OUT = "/home/ubuntu/transcode/03_transcode_staging"
+
+WINSCP_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "winscp.com"))
 
 # Video extensions to scan for
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".m4v")
@@ -54,7 +62,7 @@ def get_vm_free_space_gb(conn, vm_name):
             return 0
         output = result.stdout
     except Exception as e:
-        tqdm.write(f"[{vm_name}] Warning: Space check failed. Error: {e}")
+        logging.warning(f"[{vm_name}] Space check failed: {e}")
         return 0
 
     for line in output.splitlines():
@@ -80,7 +88,7 @@ def get_remote_status():
     staged_map = {}  # {vm_ip: {basenames}}
 
     for vm in VMS:
-        tqdm.write(f"Checking status of {vm['name']}...")
+        logging.info(f"Checking status of {vm['name']}...")
         staged_map[vm["ip"]] = set()
         try:
             with get_connection(
@@ -101,18 +109,88 @@ def get_remote_status():
                     base, _ = os.path.splitext(f)
                     staged_map[vm["ip"]].add(base.lower())
         except Exception as e:
-            tqdm.write(f"Could not connect to {vm['name']}: {e}")
+            logging.error(f"Could not connect to {vm['name']}: {e}")
 
     return active, staged_map
 
 
-def upload_file(conn, sftp, vm_name, local_path, vm_index):
+def run_winscp_command(vm, command_str):
+    """Executes a command via WinSCP and redirects output to a local log file."""
+    # WinSCP expects a specific connection string format.
+    fingerprint = "*"  # Use wildcard to accept any host key in script mode
+    connection_url = f"sftp://{vm['user']}@{vm['ip']}/"
+
+    # 1. Check if the engine (winscp.exe) exists. .com needs .exe to function.
+    winscp_engine = WINSCP_PATH.replace(".com", ".exe")
+    if not os.path.exists(winscp_engine):
+        logging.error(
+            f"[{vm['name']}] Error: winscp.exe not found in {os.path.dirname(WINSCP_PATH)}"
+        )
+        return False
+
+    # 2. Resolve the key path.
+    # We only accept .ppk keys for WinSCP.
+    key_path = vm.get("key_ppk")
+    if not key_path:
+        logging.error(f"[{vm['name']}] Error: 'key_ppk' is required for WinSCP.")
+        return False
+    resolved_key = os.path.abspath(os.path.expanduser(str(key_path)))
+
+    if not os.path.exists(resolved_key):
+        logging.error(f"[{vm['name']}] Error: Private key not found: {resolved_key}")
+        return False
+
+    log_path = os.path.join(os.path.dirname(__file__), f"winscp_{vm['name']}.log")
+    winscp_cmd = [
+        WINSCP_PATH,
+        "/ini=nul",  # Use a temporary configuration to ensure script portability
+        "/rawconfig",
+        "Interface\\FlushConsole=1",  # Force WinSCP to bypass CRT buffering
+    ]
+
+    try:
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            with subprocess.Popen(
+                winscp_cmd,
+                stdin=subprocess.PIPE,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+            ) as proc:
+                # Pass commands via stdin to avoid Windows command-line quoting/escaping issues
+                if proc.stdin:
+                    commands = [
+                        f'open {connection_url} -privatekey="{resolved_key}" -hostkey={fingerprint}',
+                        "option batch abort",
+                        "option confirm off",
+                        command_str,
+                        "exit",
+                        "",
+                    ]
+                    proc.stdin.write(("\n".join(commands) + "\n").encode("utf-8"))
+                    proc.stdin.flush()
+                    proc.stdin.close()
+
+                proc.wait()
+                if proc.returncode != 0:
+                    logging.error(
+                        f"[{vm['name']}] WinSCP failed (Code {proc.returncode}). Check {os.path.basename(log_path)}"
+                    )
+                    return False
+            return True
+    except Exception as e:
+        logging.error(f"[{vm['name']}] WinSCP Execution Error: {e}")
+        return False
+
+
+def upload_file(conn, sftp, vm, local_path, vm_index):
     """Uploads file to staging with resumption, then moves it to input atomically."""
     filename = os.path.basename(local_path)
+    vm_name = vm["name"]
     remote_staging_path = f"{REMOTE_STAGING_IN}/{filename}"
     remote_input_path = f"{REMOTE_INPUT}/{filename}"
 
-    tqdm.write(f"Uploading '{filename}' to {vm_name} (staging)...")
+    logging.info(f"Uploading '{filename}' to {vm_name} (staging)...")
 
     try:
         # Resumption logic: Check if remote file exists and get its size
@@ -126,48 +204,43 @@ def upload_file(conn, sftp, vm_name, local_path, vm_index):
         local_size = os.path.getsize(local_path)
 
         if remote_size > local_size:
-            tqdm.write(
-                f"[{vm_name}] Remote staging file larger than local. Restarting upload."
+            logging.warning(
+                f"[{vm_name}] Remote staging file larger than local. Overwriting."
             )
             remote_size = 0
 
         if remote_size < local_size:
-            mode = "ab" if remote_size > 0 else "wb"
-            if remote_size > 0:
-                tqdm.write(
-                    f"[{vm_name}] Resuming upload of '{filename}' from {remote_size / (1024**2):.2f} MB"
+            # Use native absolute paths for WinSCP via stdin
+            winscp_local_path = os.path.abspath(local_path)
+
+            # WinSCP "put -resume" handles the logic of checking offset and appending.
+            cmd = f'put -resume "{winscp_local_path}" "{remote_staging_path}"'
+            if not run_winscp_command(vm, cmd):
+                return False  # Abort if transfer failed
+
+        # Verification step: Check remote size after upload
+        try:
+            remote_stat = sftp.stat(remote_staging_path)
+            if remote_stat.st_size != local_size:
+                logging.error(
+                    f"[{vm_name}] Upload size mismatch for '{filename}': Local={local_size}, Remote={remote_stat.st_size}"
                 )
+                return False
+        except Exception as e:
+            logging.error(f"[{vm_name}] Failed to verify uploaded file size: {e}")
+            return False
 
-            with tqdm(
-                total=local_size,
-                initial=remote_size,
-                unit="B",
-                unit_scale=True,
-                desc=f"[{vm_name}] Uploading {filename}",
-                position=vm_index,
-                leave=False,
-            ) as pbar:
-                with open(local_path, "rb") as f_local:
-                    f_local.seek(remote_size)
-                    with sftp.open(remote_staging_path, mode) as f_remote:
-                        f_remote.set_pipelined(True)  # Enable WinSCP-style pipelining
-                        # Use 1MB buffer to reduce Python overhead
-                        while True:
-                            chunk = f_local.read(1048576)
-                            if not chunk:
-                                break
-                            f_remote.write(chunk)
-                            pbar.update(len(chunk))
-
-        tqdm.write(f"Transfer complete. Moving to input folder on {vm_name}...")
-        result = conn.run(
+        logging.info(f"[{vm_name}] Transfer verified. Moving to input folder...")
+        mv_res = conn.run(
             f'mv "{remote_staging_path}" "{remote_input_path}"', hide=True, warn=True
         )
-        if result.ok:
-            tqdm.write(f"Successfully enqueued '{filename}' on {vm_name}.")
+        if mv_res.ok:
+            logging.info(f"[{vm_name}] Successfully enqueued '{filename}'.")
             return True
+        else:
+            logging.error(f"[{vm_name}] Error moving file: {mv_res.stderr}")
     except Exception as e:
-        tqdm.write(f"Failed to upload '{filename}' to {vm_name}: {e}")
+        logging.error(f"Failed to upload '{filename}' to {vm_name}: {e}")
     return False
 
 
@@ -195,71 +268,63 @@ def process_vm(vm, files_to_upload, vm_index):
                     )
 
                     if local_size > remote_size:
-                        tqdm.write(
+                        logging.warning(
                             f"[{vm['name']}] Local file larger than remote. Restarting download."
                         )
                         local_size = 0
 
                     if local_size < remote_size:
-                        tqdm.write(f"[{vm['name']}] Downloading '{filename}'...")
-                        if local_size > 0:
-                            tqdm.write(
-                                f"[{vm['name']}] Resuming download from {local_size / (1024**2):.2f} MB"
-                            )
+                        logging.info(f"[{vm['name']}] Downloading '{filename}'...")
+                        # Use native absolute paths for WinSCP via stdin
+                        winscp_local_path = os.path.abspath(local_path)
 
-                        mode = "ab" if local_size > 0 else "wb"
-                        with tqdm(
-                            total=remote_size,
-                            initial=local_size,
-                            unit="B",
-                            unit_scale=True,
-                            desc=f"[{vm['name']}] Downloading {filename}",
-                            position=vm_index,
-                            leave=False,
-                        ) as pbar:
-                            with sftp.open(remote_path, "rb") as f_remote:
-                                f_remote.seek(local_size)
-                                f_remote.prefetch()  # Request chunks in advance for speed
-                                with open(local_path, mode) as f_local:
-                                    while True:
-                                        # Read in 1MB chunks from the prefetch buffer
-                                        chunk = f_remote.read(1048576)
-                                        if not chunk:
-                                            break
-                                        f_local.write(chunk)
-                                        pbar.update(len(chunk))
+                        # WinSCP "get -resume" for fast, resumable downloads
+                        cmd = f'get -resume "{remote_path}" "{winscp_local_path}"'
+                        if not run_winscp_command(vm, cmd):
+                            continue  # Skip verification/cleanup if download failed
 
-                    # Verify completion before cleanup
-                    if (
-                        os.path.exists(local_path)
-                        and os.path.getsize(local_path) == remote_size
-                    ):
-                        tqdm.write(
-                            f"[{vm['name']}] Download complete. Deleting remote copy..."
+                    # Verification step: Check local size after download
+                    try:
+                        actual_local_size = (
+                            os.path.getsize(local_path)
+                            if os.path.exists(local_path)
+                            else 0
                         )
-                        sftp.remove(remote_path)
-
-                        # Find and delete local original raw video
-                        base_name, _ = os.path.splitext(filename)
-                        for ext in VIDEO_EXTENSIONS:
-                            local_original = os.path.join(
-                                LOCAL_INPUT_DIR, base_name + ext
+                        if actual_local_size != remote_size:
+                            logging.error(
+                                f"[{vm['name']}] Download size mismatch for '{filename}': Remote={remote_size}, Local={actual_local_size}"
                             )
-                            if os.path.exists(local_original):
-                                tqdm.write(
-                                    f"[{vm['name']}] Deleting local original: {local_original}"
-                                )
-                                os.remove(local_original)
-                                break
+                            continue
+                    except Exception as e:
+                        logging.error(
+                            f"[{vm['name']}] Failed to verify downloaded file size: {e}"
+                        )
+                        continue
+
+                    logging.info(
+                        f"[{vm['name']}] Download verified. Deleting remote copy..."
+                    )
+                    sftp.remove(remote_path)
+
+                    # Find and delete local original raw video
+                    base_name, _ = os.path.splitext(filename)
+                    for ext in VIDEO_EXTENSIONS:
+                        local_original = os.path.join(LOCAL_INPUT_DIR, base_name + ext)
+                        if os.path.exists(local_original):
+                            logging.info(
+                                f"[{vm['name']}] Deleting local original: {local_original}"
+                            )
+                            os.remove(local_original)
+                            break
                 except Exception as e:
-                    tqdm.write(f"[{vm['name']}] Error downloading {filename}: {e}")
+                    logging.error(f"[{vm['name']}] Error downloading {filename}: {e}")
 
             # ------------------ PHASE 2: UPLOAD NEW RAW VIDEOS ------------------
             if not files_to_upload:
                 return
 
             space = get_vm_free_space_gb(conn, vm["name"])
-            tqdm.write(f"[{vm['name']}] Current free space: {space} GB.")
+            logging.info(f"[{vm['name']}] Current free space: {space} GB.")
 
             for local_file in files_to_upload:
                 filename = os.path.basename(local_file)
@@ -267,29 +332,29 @@ def process_vm(vm, files_to_upload, vm_index):
                 required_space = max(MIN_VM_FREE_SPACE_GB, math.ceil(file_size_gb * 3))
 
                 if space > required_space:
-                    success = upload_file(conn, sftp, vm["name"], local_file, vm_index)
+                    success = upload_file(conn, sftp, vm, local_file, vm_index)
                     if success:
                         # Update local space tracking for this thread
                         space -= math.ceil(file_size_gb * 2.5)
                 else:
-                    tqdm.write(
+                    logging.info(
                         f"[{vm['name']}] Skipping '{filename}' - insufficient space (needs {required_space} GB)."
                     )
     except Exception as e:
-        tqdm.write(f"[{vm['name']}] Connection or Task failed: {e}")
+        logging.error(f"[{vm['name']}] Connection or Task failed: {e}")
 
 
 def main():
     if not os.path.exists(LOCAL_OUTPUT_DIR):
         os.makedirs(LOCAL_OUTPUT_DIR)
 
-    print("--- Initializing Parallel Sync ---")
+    logging.info("--- Initializing Parallel Sync ---")
 
     # Get remote status to avoid duplicates and find interrupted uploads
     active_remotes, staged_map = get_remote_status()
 
     # Scan for local candidates
-    print("\n--- Scanning for New Local Videos ---")
+    logging.info("--- Scanning for New Local Videos ---")
     all_local_files = [
         f
         for f in glob.glob(os.path.join(LOCAL_INPUT_DIR, "*"))
@@ -304,9 +369,9 @@ def main():
     ]
 
     if not files_to_process:
-        print("No new local videos to process.")
+        logging.info("No new local videos to process.")
     else:
-        print(f"Found {len(files_to_process)} candidates. Assigning to VMs...")
+        logging.info(f"Found {len(files_to_process)} candidates. Assigning to VMs...")
 
     # Assignment Logic
     vm_assignments = [[] for _ in range(len(VMS))]
@@ -320,7 +385,7 @@ def main():
             if basename in staged_map[vm["ip"]]:
                 vm_assignments[i].append(file_path)
                 assigned = True
-                tqdm.write(
+                logging.info(
                     f"Resuming interrupted upload of '{basename}' on {vm['name']}."
                 )
                 break
@@ -336,7 +401,7 @@ def main():
         for i, vm in enumerate(VMS):
             executor.submit(process_vm, vm, vm_assignments[i], i)
 
-    print("\n--- All VM tasks submitted ---")
+    logging.info("--- All VM tasks submitted ---")
 
 
 if __name__ == "__main__":

@@ -109,6 +109,13 @@ for filepath in "$INPUT_DIR"/*; do
         -y "$staging_path" 2>&1 | tr '\r' '\n' >> "$LOG_FILE"
 
     if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        # Verification: Check if output file exists and is not empty
+        if [ ! -s "$staging_path" ]; then
+            echo "ERROR: Transcode finished but output file is missing or empty: $staging_path" >> "$LOG_FILE"
+            rm -f "$staging_path"
+            continue
+        fi
+
         mv "$staging_path" "$final_path"
         echo "Successfully transcoded: $filename" >> "$LOG_FILE"
         # Only delete source file on success

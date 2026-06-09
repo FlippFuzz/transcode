@@ -5,24 +5,28 @@ VMS = [
         "ip": "100.101.102.1",
         "user": "ubuntu",
         "key": r"C:\Users\YourName\.ssh\oracle_key",
+        "key_ppk": r"C:\Users\YourName\.ssh\oracle_key.ppk",
     },
     {
         "name": "vm2",
         "ip": "100.101.102.2",
         "user": "ubuntu",
         "key": r"C:\Users\YourName\.ssh\oracle_key",
+        "key_ppk": r"C:\Users\YourName\.ssh\oracle_key.ppk",
     },
     {
         "name": "vm3",
         "ip": "100.101.102.3",
         "user": "ubuntu",
         "key": r"C:\Users\YourName\.ssh\oracle_key",
+        "key_ppk": r"C:\Users\YourName\.ssh\oracle_key.ppk",
     },
     {
         "name": "vm4",
         "ip": "100.101.102.4",
         "user": "ubuntu",
         "key": r"C:\Users\YourName\.ssh\oracle_key",
+        "key_ppk": r"C:\Users\YourName\.ssh\oracle_key.ppk",
     },
 ]
 
