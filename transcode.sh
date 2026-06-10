@@ -55,6 +55,8 @@ if [ ! -f "$FFMPEG_BIN" ] || [ $(( $(date +%s) - $(stat -c %Y "$UPDATE_STAMP" 2>
     cd "$(dirname "$0")"
     if [ -d .git ]; then
         OLD_HASH=$(git rev-parse HEAD 2>/dev/null)
+        # Reset local changes to ensure git pull succeeds without merge conflicts
+        git reset --hard HEAD >> "$LOG_FILE" 2>&1
         if git pull >> "$LOG_FILE" 2>&1; then
             NEW_HASH=$(git rev-parse HEAD 2>/dev/null)
             if [ "$OLD_HASH" != "$NEW_HASH" ]; then
