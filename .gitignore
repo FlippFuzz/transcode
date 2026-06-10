@@ -216,4 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
 config_local.py
+ffmpeg
+ffmpeg-master-latest-linuxarm64-gpl.tar.xz
+01_upload_staging/
+02_transcode_queue/
+03_transcode_staging/
+04_transcode_finished/
