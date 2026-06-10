@@ -101,11 +101,12 @@ for filepath in "$INPUT_DIR"/*; do
     # 'time' is included to log the duration of each transcode.
     # Example:
     # Test Input file: 3.8G
-    # Preset 4 - about speed=0.25x, 1.6G - I am OK with the slower speed for 100MB size difference
+    # Preset 4 - about speed=0.25x, 1.6G
     # Preset 6 - about speed=0.479x, 1.7G
+    # Chosen preset 3 because I am OK with slower speed
     nice -n 19 time "$FFMPEG_BIN" -stats_period 60 \
-        -threads 4 -i "$filepath" -c:v libsvtav1 -preset 4 -crf 28 \
-        -pix_fmt yuv420p10le -svtav1-params tune=0:scd=1:lp=4 -c:a libopus -b:a 128k \
+        -threads 4 -i "$filepath" -c:v libsvtav1 -preset 3 -crf 28 \
+        -pix_fmt yuv420p10le -svtav1-params tune=0:scd=1:lp=4:keyint=10s -c:a libopus -b:a 128k \
         -y "$staging_path" 2>&1 | tr '\r' '\n' >> "$LOG_FILE"
 
     if [ ${PIPESTATUS[0]} -eq 0 ]; then
