@@ -60,7 +60,8 @@ if [ ! -f "$FFMPEG_BIN" ] || [ $(( $(date +%s) - $(stat -c %Y "$UPDATE_STAMP" 2>
         if git pull >> "$LOG_FILE" 2>&1; then
             NEW_HASH=$(git rev-parse HEAD 2>/dev/null)
             if [ "$OLD_HASH" != "$NEW_HASH" ]; then
-                chmod +x "$0" # Ensure the updated script is executable
+                # Ensure the updated script is executable
+                chmod +x "$(basename "$0")" >> "$LOG_FILE" 2>&1
                 echo "--- Script updated from $OLD_HASH to $NEW_HASH. Restarting... ---" >> "$LOG_FILE"
                 exec "$0" "$@"
             fi
