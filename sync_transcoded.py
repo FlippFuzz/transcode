@@ -15,6 +15,8 @@ from config_local import VMS, LOCAL_INPUT_DIR, LOCAL_OUTPUT_DIR
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+# Silence verbose Paramiko logs
+logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 # Optimize Paramiko for high-latency/high-bandwidth connections (WinSCP-like behavior)
 # These settings increase the amount of data in flight (like WinSCP does)
