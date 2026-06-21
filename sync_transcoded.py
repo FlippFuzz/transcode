@@ -99,6 +99,13 @@ def get_remote_status():
                 # Files in input, output, or currently being transcoded (outbound staging) are active
                 for folder in [REMOTE_INPUT, REMOTE_OUTPUT, REMOTE_STAGING_OUT]:
                     files = list_remote_files(sftp, folder)
+
+                    # Print queued jobs if it's the input folder
+                    if folder == REMOTE_INPUT:
+                        logging.info(
+                            f"[{vm['name']}] Queued jobs: {', '.join(files) if files else 'None'}"
+                        )
+
                     for f in files:
                         base, _ = os.path.splitext(f)
                         active.add(base.lower())
@@ -367,6 +374,12 @@ def main():
         for f in all_local_files
         if os.path.splitext(os.path.basename(f))[0].lower() not in active_remotes
     ]
+
+    # Print files to process
+    if files_to_process:
+        logging.info("Local files to process:")
+        for f in files_to_process:
+            logging.info(f" - {os.path.basename(f)}")
 
     if not files_to_process:
         logging.info("No new local videos to process.")
