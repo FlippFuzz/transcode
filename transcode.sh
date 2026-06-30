@@ -13,6 +13,12 @@ UPDATE_INTERVAL=3600 # Check for updates once per hour (3600 seconds)
 UPDATE_STAMP="/tmp/.transcode_update_stamp"
 FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
 
+# Detect available CPU cores, capped at 12 (defaults to 4 if detection fails)
+CORES=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+if [ "$CORES" -gt 12 ]; then
+    CORES=12
+fi
+
 # Ensure directories exist
 mkdir -p "$INPUT_DIR" "$OUTPUT_DIR" "$STAGING_DIR" "$UPLOAD_STAGING_DIR"
 
@@ -100,6 +106,7 @@ for filepath in "$INPUT_DIR"/*; do
     # Define staging and final paths. Extension is set to .mkv.
     staging_path="$STAGING_DIR/${filename%.*}.mkv"
     final_path="$OUTPUT_DIR/${filename%.*}.mkv"
+    echo "Using CPU threads/cores limit: $CORES" >> "$LOG_FILE"
 
     # Run ffmpeg with SVT-AV1 at low priority (nice) to keep the system responsive.
     # 'time' is included to log the duration of each transcode.
@@ -109,8 +116,8 @@ for filepath in "$INPUT_DIR"/*; do
     # Preset 6 - about speed=0.479x, 1.7G
     # Chosen preset 3 because I am OK with slower speed
     nice -n 19 time "$FFMPEG_BIN" -stats_period 60 \
-        -threads 4 -i "$filepath" -c:v libsvtav1 -preset 3 -crf 28 \
-        -pix_fmt yuv420p10le -svtav1-params tune=0:scd=1:lp=4:keyint=10s -c:a libopus -b:a 128k \
+        -threads "$CORES" -i "$filepath" -c:v libsvtav1 -preset 3 -crf 28 \
+        -pix_fmt yuv420p10le -svtav1-params "tune=0:scd=1:lp=$CORES:keyint=10s" -c:a libopus -b:a 128k \
         -y "$staging_path" 2>&1 | tr '\r' '\n' >> "$LOG_FILE"
 
     if [ ${PIPESTATUS[0]} -eq 0 ]; then
