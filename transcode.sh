@@ -11,7 +11,15 @@ FFMPEG_BIN="/home/ubuntu/transcode/ffmpeg"
 MAX_LOG_SIZE=5242880 # 5MB
 UPDATE_INTERVAL=3600 # Check for updates once per hour (3600 seconds)
 UPDATE_STAMP="/tmp/.transcode_update_stamp"
-FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+
+# Detect CPU architecture to determine the correct FFmpeg build
+ARCH=$(uname -m)
+if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+    ARCH_SUFFIX="linuxarm64"
+else
+    ARCH_SUFFIX="linux64"
+fi
+FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${ARCH_SUFFIX}-gpl.tar.xz"
 
 # Detect available CPU cores, capped at 12 (defaults to 4 if detection fails)
 CORES=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
@@ -45,15 +53,15 @@ if [ ! -f "$FFMPEG_BIN" ] || [ $(( $(date +%s) - $(stat -c %Y "$UPDATE_STAMP" 2>
     # 1. Update ffmpeg (BtbN builds are frequent and include SVT-AV1 improvements)
     # wget -N uses timestamping to only download if the remote file is newer than the local archive
     FFMPEG_DIR=$(dirname "$FFMPEG_BIN")
-    ARCHIVE_PATH="$FFMPEG_DIR/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+    ARCHIVE_PATH="$FFMPEG_DIR/ffmpeg-master-latest-${ARCH_SUFFIX}-gpl.tar.xz"
     
     if wget -qN "$FFMPEG_URL" -P "$FFMPEG_DIR"; then
         # If the archive is newer than the existing binary, extract and replace it
         if [ "$ARCHIVE_PATH" -nt "$FFMPEG_BIN" ]; then
             echo "--- New ffmpeg version detected. Updating binary... ---" >> "$LOG_FILE"
             tar -xf "$ARCHIVE_PATH" -C "$FFMPEG_DIR"
-            mv "$FFMPEG_DIR/ffmpeg-master-latest-linuxarm64-gpl/bin/ffmpeg" "$FFMPEG_BIN"
-            rm -rf "$FFMPEG_DIR/ffmpeg-master-latest-linuxarm64-gpl"
+            mv "$FFMPEG_DIR/ffmpeg-master-latest-${ARCH_SUFFIX}-gpl/bin/ffmpeg" "$FFMPEG_BIN"
+            rm -rf "$FFMPEG_DIR/ffmpeg-master-latest-${ARCH_SUFFIX}-gpl"
         fi
     fi
 
