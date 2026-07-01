@@ -85,42 +85,54 @@ def list_remote_files(sftp, directory):
 
 
 def get_remote_status():
-    """Scans all VMs to categorize files as active or staged."""
-    active = set()
+    """Scans all VMs to categorize files and measure current transcoding load."""
+    active_all = set()
     staged_map = {}  # {vm_ip: {basenames}}
+    vm_loads = {}  # {vm_ip: active_job_count}
 
     for vm in VMS:
         logging.info(f"Checking status of {vm['name']}...")
-        staged_map[vm["ip"]] = set()
+        ip = vm["ip"]
+        staged_map[ip] = set()
+        vm_loads[ip] = 0
         try:
-            with get_connection(
-                vm
-            ) as conn:  # Connection context manager handles client setup
+            with get_connection(vm) as conn:
                 sftp = conn.sftp()
 
-                # Files in input, output, or currently being transcoded (outbound staging) are active
-                for folder in [REMOTE_INPUT, REMOTE_OUTPUT, REMOTE_STAGING_OUT]:
+                # 1. Input queue and active transcode folders count towards current VM load
+                for folder in [REMOTE_INPUT, REMOTE_STAGING_OUT]:
                     files = list_remote_files(sftp, folder)
+                    valid_files = [f for f in files if not f.startswith(".")]
 
-                    # Print queued jobs if it's the input folder
                     if folder == REMOTE_INPUT:
                         logging.info(
-                            f"[{vm['name']}] Queued jobs: {', '.join(files) if files else 'None'}"
+                            f"[{vm['name']}] Queued jobs: {', '.join(valid_files) if valid_files else 'None'}"
                         )
 
-                    for f in files:
-                        base, _ = os.path.splitext(f)
-                        active.add(base.lower())
+                    # Accumulate load count
+                    vm_loads[ip] += len(valid_files)
 
-                # Check inbound staging for interrupted uploads
+                    for f in valid_files:
+                        base, _ = os.path.splitext(f)
+                        active_all.add(base.lower())
+
+                # 2. Finished files are active (to prevent re-uploading), but do not count as transcode load
+                completed_files = list_remote_files(sftp, REMOTE_OUTPUT)
+                for f in completed_files:
+                    if not f.startswith("."):
+                        base, _ = os.path.splitext(f)
+                        active_all.add(base.lower())
+
+                # 3. Check inbound staging for interrupted uploads
                 staging_files = list_remote_files(sftp, REMOTE_STAGING_IN)
                 for f in staging_files:
-                    base, _ = os.path.splitext(f)
-                    staged_map[vm["ip"]].add(base.lower())
+                    if not f.startswith("."):
+                        base, _ = os.path.splitext(f)
+                        staged_map[ip].add(base.lower())
         except Exception as e:
             logging.error(f"Could not connect to {vm['name']}: {e}")
 
-    return active, staged_map
+    return active_all, staged_map, vm_loads
 
 
 def run_winscp_command(vm, command_str):
@@ -359,8 +371,8 @@ def main():
 
     logging.info("--- Initializing Parallel Sync ---")
 
-    # Get remote status to avoid duplicates and find interrupted uploads
-    active_remotes, staged_map = get_remote_status()
+    # Get remote status to avoid duplicates, find interrupted uploads, and measure active loads
+    active_remotes, staged_map, vm_loads = get_remote_status()
 
     # Scan for local candidates
     logging.info("--- Scanning for New Local Videos ---")
@@ -388,8 +400,9 @@ def main():
     else:
         logging.info(f"Found {len(files_to_process)} candidates. Assigning to VMs...")
 
-    # Assignment Logic
+    # Load-balanced Assignment Logic
     vm_assignments = [[] for _ in range(len(VMS))]
+    current_loads = [vm_loads.get(vm["ip"], 0) for vm in VMS]
     unassigned = []
 
     for file_path in files_to_process:
@@ -399,6 +412,9 @@ def main():
         for i, vm in enumerate(VMS):
             if basename in staged_map[vm["ip"]]:
                 vm_assignments[i].append(file_path)
+                current_loads[
+                    i
+                ] += 1  # Resumed transfer adds to this VM's future processing load
                 assigned = True
                 logging.info(
                     f"Resuming interrupted upload of '{basename}' on {vm['name']}."
@@ -407,9 +423,14 @@ def main():
         if not assigned:
             unassigned.append(file_path)
 
-    # Round-robin the remaining files
-    for i, file_path in enumerate(unassigned):
-        vm_assignments[i % len(VMS)].append(file_path)
+    # Distribute remaining files to the VM with the lowest current load
+    for file_path in unassigned:
+        min_idx = current_loads.index(min(current_loads))
+        vm_assignments[min_idx].append(file_path)
+        current_loads[min_idx] += 1
+        logging.info(
+            f"Assigned '{os.path.basename(file_path)}' to {VMS[min_idx]['name']} (Estimated Load: {current_loads[min_idx]})."
+        )
 
     # Run parallel tasks
     with ThreadPoolExecutor(max_workers=len(VMS)) as executor:
