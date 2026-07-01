@@ -116,6 +116,9 @@ for filepath in "$INPUT_DIR"/*; do
     final_path="$OUTPUT_DIR/${filename%.*}.mkv"
     echo "Using CPU threads/cores limit: $CORES" >> "$LOG_FILE"
 
+    # Measure the file size of the original input file
+    input_size=$(stat -c%s "$filepath")
+
     # Run ffmpeg with SVT-AV1 at low priority (nice) to keep the system responsive.
     # 'time' is included to log the duration of each transcode.
     # Example:
@@ -136,10 +139,24 @@ for filepath in "$INPUT_DIR"/*; do
             continue
         fi
 
-        mv "$staging_path" "$final_path"
-        echo "Successfully transcoded: $filename" >> "$LOG_FILE"
-        # Only delete source file on success
-        rm "$filepath"
+        # Measure the size of the output file
+        output_size=$(stat -c%s "$staging_path")
+
+        if [ "$output_size" -ge "$input_size" ]; then
+            # If the transcoded file is not smaller than the input, discard it and move the original instead
+            echo "Optimizing: Transcoded file size ($output_size bytes) is not smaller than original ($input_size bytes). Discarding transcode and keeping original file." >> "$LOG_FILE"
+            rm -f "$staging_path"
+            
+            # Move original file to the output folder (retaining its original extension and name)
+            mv "$filepath" "$OUTPUT_DIR/$filename"
+            echo "Successfully moved original: $filename to output" >> "$LOG_FILE"
+        else
+            # Keep the optimized transcoded file
+            mv "$staging_path" "$final_path"
+            echo "Successfully transcoded: $filename (Transcoded size: $output_size bytes, original: $input_size bytes)" >> "$LOG_FILE"
+            # Delete original source file only on optimization success
+            rm "$filepath"
+        fi
     else
         echo "ERROR: Failed to transcode: $filename. See logs for details." >> "$LOG_FILE"
     fi

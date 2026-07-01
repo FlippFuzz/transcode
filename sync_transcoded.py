@@ -3,6 +3,7 @@ import subprocess
 import glob
 import math
 import logging
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from fabric import Connection, Config
 from paramiko import common
@@ -284,6 +285,34 @@ def process_vm(vm, files_to_upload, vm_index):
 
                 try:
                     remote_size = sftp.stat(remote_path).st_size
+
+                    # Locate the local original raw video
+                    base_name, _ = os.path.splitext(filename)
+                    local_original = None
+                    for ext in VIDEO_EXTENSIONS:
+                        potential_original = os.path.join(
+                            LOCAL_INPUT_DIR, base_name + ext
+                        )
+                        if os.path.exists(potential_original):
+                            local_original = potential_original
+                            break
+
+                    # OPTIMIZATION: If the remote file size is greater than or equal to our local original,
+                    # the transcode did not save space (or the server kept the original).
+                    # We can skip the download completely and relocate the local original.
+                    if local_original and remote_size >= os.path.getsize(
+                        local_original
+                    ):
+                        logging.info(
+                            f"[{vm['name']}] '{filename}' was not optimized (original is smaller or equal). Skipping download, relocating local copy..."
+                        )
+                        shutil.move(local_original, local_path)
+
+                        logging.info(f"[{vm['name']}] Deleting remote copy...")
+                        sftp.remove(remote_path)
+                        continue
+
+                    # Fallback to normal download logic if sizes do not match or original isn't found
                     local_size = (
                         os.path.getsize(local_path) if os.path.exists(local_path) else 0
                     )
@@ -327,16 +356,12 @@ def process_vm(vm, files_to_upload, vm_index):
                     )
                     sftp.remove(remote_path)
 
-                    # Find and delete local original raw video
-                    base_name, _ = os.path.splitext(filename)
-                    for ext in VIDEO_EXTENSIONS:
-                        local_original = os.path.join(LOCAL_INPUT_DIR, base_name + ext)
-                        if os.path.exists(local_original):
-                            logging.info(
-                                f"[{vm['name']}] Deleting local original: {local_original}"
-                            )
-                            os.remove(local_original)
-                            break
+                    # Delete the original raw video since it was successfully transcoded & optimized
+                    if local_original and os.path.exists(local_original):
+                        logging.info(
+                            f"[{vm['name']}] Deleting local original: {local_original}"
+                        )
+                        os.remove(local_original)
                 except Exception as e:
                     logging.error(f"[{vm['name']}] Error downloading {filename}: {e}")
 
